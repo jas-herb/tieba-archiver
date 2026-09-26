@@ -1,0 +1,13 @@
+# 环境
+venv/
+.venv/
+__pycache__/
+.DS_Store
+
+# 在本地运行工具时的抓取结果：帖子数据含他人信息，不进仓库。
+# 只忽略根目录下的，网页版的存档（archives/tieba_*/）要提交
+/tieba_*/
+/scraped_data/
+
+# 问答模式的存档位置
+/贴吧存档/

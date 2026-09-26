@@ -1,0 +1,60 @@
+# 打包 Windows 免安装版 tieba-archiver.exe（双击就是问答模式，存档保存在 exe 旁边的「贴吧存档」里）。
+# 手动运行：Actions 页面选「打包 Windows 版」→ Run workflow，完成后在运行页面底部的 Artifacts 下载。
+# 推送 v 开头的标签（比如 v1.0）时，还会自动发布到 Releases 页面。
+name: 打包 Windows 版
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 发布到 Releases 需要
+
+env:
+  TEST_THREAD: "8651017931" # 和「测试」里用的是同一个公开小帖子
+
+jobs:
+  exe:
+    # 只在工具本身的仓库里运行；用模板创建的存档仓库不需要（还会访问贴吧、消耗免费额度）
+    if: github.repository == 'jas-herb/tieba-archiver'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt "pyinstaller>=6.10,<7"
+
+      - name: 打包
+        run: pyinstaller --onefile --console --name tieba-archiver --noconfirm tieba_dump.py
+
+      - name: 测试打包好的 exe（命令行模式、问答模式、生成 PDF）
+        run: |
+          mkdir smoke && cp dist/tieba-archiver.exe smoke/ && cd smoke
+          ./tieba-archiver.exe "$TEST_THREAD" -o out
+          printf '%s\nn\ny\nn\n' "$TEST_THREAD" | ./tieba-archiver.exe
+          ls "贴吧存档/tieba_${TEST_THREAD}_PDF/"*.pdf > /dev/null || { echo "::error::没有生成 PDF"; exit 1; }
+          for f in out/index.html "贴吧存档/tieba_$TEST_THREAD/index.html"; do
+            test -f "$f" || { echo "::error::缺少 $f"; exit 1; }
+          done
+          echo "exe 可以正常抓取、生成页面和 PDF ✓"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tieba-archiver-windows
+          path: dist/tieba-archiver.exe
+
+      - name: 发布到 Releases
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/tieba-archiver.exe --title "$GITHUB_REF_NAME" --generate-notes

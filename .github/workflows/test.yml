@@ -1,0 +1,468 @@
+# 推送代码时自动测试：Python 3.9（aiotieba 4.6.1）和 3.12（aiotieba 4.7），外加 Windows。
+# 用一个公开的小帖子跑一遍命令行模式、问答模式、生成页面和 PDF。
+name: 测试
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TEST_THREAD: "8651017931" # python 吧置顶帖「资源导航」：公开、稳定、很小，含链接和图片
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    # 只在工具本身的仓库里运行；用模板创建的存档仓库不需要（还会访问贴吧、消耗免费额度）
+    if: github.repository == 'jas-herb/tieba-archiver'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, python: "3.9" }
+          - { os: ubuntu-latest, python: "3.12" }
+          - { os: windows-latest, python: "3.12" }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          pip show aiotieba | grep '^Version'
+
+      - name: 离线检查：md 转义和换行、链接、帖子 ID、存档损坏时不覆盖、限流时不误标删除、旧版本去重、threads.txt、PDF 图片
+        run: |
+          python - <<'EOF'
+          import asyncio, copy, json, sys
+          from pathlib import Path
+          import render, tieba_dump as td
+          sys.path.insert(0, ".github/scripts")
+          import archive_update as au
+
+          real_sleep = asyncio.sleep
+          asyncio.sleep = lambda *a, **k: real_sleep(0)  # 测试里不用真的等
+
+          # 帖子 ID：分享文案标题里的日期不能当成帖子
+          assert render.parse_tid("【20240925 更新】招募帖 https://tieba.baidu.com/p/8651017931?share=1") == 8651017931
+          assert render.parse_tid("1234567890 某帖备注") == 1234567890 and render.parse_tid("某帖 20240925") is None
+          assert render.parse_tids("https://tieba.baidu.com/p/111111111 https://tieba.baidu.com/p/222222222 20240925") == [111111111, 222222222]
+          print("帖子 ID 解析 ✓")
+
+          def floor(n, text, frags=None, **kw):
+              return {"floor": n, "pid": n, "user": {"show_name": "*某人*", "level": 1}, "is_thread_author": n == 1,
+                      "create_time": "2026-01-01 00:00:00", "agree": 0, "text": text, "images": [], "comments": [],
+                      "fragments": frags or [{"type": "Text", "text": text}], **kw}
+
+          def thread(tid, floors, fetched="2026-01-01 00:00:00"):
+              return {"tid": tid, "title": "测试 <b>", "forum": "测试", "fid": 1, "author": {"show_name": "a"}, "create_time": "",
+                      "url": f"https://tieba.baidu.com/p/{tid}", "fetched_at": fetched, "floors": floors}
+
+          # md：正文转义、保留换行、链接显示标题、只把 http(s) 做成链接
+          data = thread(1, [floor(1, "第一行\n# 不是标题\n- 不是列表\n1. 不是列表"),
+                            floor(2, "<!-- 不是注释"),
+                            floor(3, "", [{"type": "Link", "text": "https://tieba.baidu.com/mo/q/checkurl?url=x", "title": "百度网盘",
+                                           "url": "https://pan.baidu.com/s/1"},
+                                          {"type": "Link", "text": "javascript:alert(1)", "title": "坏链接", "url": "javascript:alert(1)"}]),
+                            floor(4, "第四层还在", [{"type": "Unknown", "text": "某个梗", "raw": {"type": 40}}])])
+          out = Path("md-test"); out.mkdir(exist_ok=True)
+          render.write_markdown(data, out / "thread.md")
+          md = (out / "thread.md").read_text(encoding="utf-8")
+          assert "第一行<br>\n\\# 不是标题<br>\n\\- 不是列表<br>\n1\\. 不是列表" in md, "换行或行首的转义不对"
+          assert "<!--" not in md and "&lt;!-- 不是注释" in md, "<!-- 没有转义，后面的楼层会看不到"
+          assert "[百度网盘](https://pan.baidu.com/s/1)" in md and "javascript:" not in md, "链接不对"
+          assert "某个梗" in md and '<a name="bottom">' in md and "跳到最后" in md, "未识别内容或跳转链接不对"
+          # 分页后每页都能跳到本页顶部/底部，不在最后一页时还能跳到最新的楼层
+          render.write_markdown(thread(1, [floor(n, f"第{n}楼") for n in (1, 150, 250)]), out / "long.md")
+          p1, p3 = (out / "long.md").read_text(encoding="utf-8"), (out / "long_3.md").read_text(encoding="utf-8")
+          assert "[⬇ 本页底部](#bottom)" in p1 and "[⬆ 本页顶部](#top)" in p1 and p1.count("(long_3.md#bottom)") == 2, "分页跳转链接不对"
+          assert "本页底部（最新的楼层）](#bottom)" in p3 and "long_3.md#" not in p3, "最后一页的跳转链接不对"
+          render.write_html(data, out / "index.html")
+          html = (out / "index.html").read_text(encoding="utf-8")
+          assert ">百度网盘</a>" in html and 'href="javascript' not in html and "某个梗" in html, "网页里的链接或内容不对"
+          print("md / 网页的转义、换行、链接 ✓")
+
+          # 旧版本：内容来回变时同样的内容只存一次
+          a = {"fetched_at": "t1", "floors": [floor(1, "A")]}
+          for i, t in enumerate(["B", "A", "B", "A"], 2):
+              a = td.merge_archive(a, {"fetched_at": f"t{i}", "floors": [floor(1, t)]})
+          assert len(a["floors"][0]["earlier_versions"]) == 2, a["floors"][0]["earlier_versions"]
+          print("旧版本去重 ✓")
+
+          # 被限流时接口少给内容：再抓一次核对，两次都没看到的才算删除；真删了照样标出来
+          full = [floor(i, f"第{i}层") for i in range(1, 41)]
+          script = {1: full, 2: full[:10], 3: full, 4: full[:32], 5: full[:32]}
+          calls = []
+          async def fake_fetch(tid, bduss=""):
+              calls.append(1)
+              return thread(tid, copy.deepcopy(script[len(calls)]), f"2026-01-0{len(calls)} 00:00:00")
+          td.fetch_thread = fake_fetch
+          home = Path("merge-test")
+          asyncio.run(td.archive(5, home, no_images=True))
+          d = asyncio.run(td.archive(5, home, no_images=True))
+          assert len(calls) == 3 and not any(f.get("missing_since") for f in d["floors"]), "被限流时把楼层误标成了已删除"
+          d = asyncio.run(td.archive(5, home, no_images=True))
+          assert len(calls) == 5 and sum(bool(f.get("missing_since")) for f in d["floors"]) == 8, "真删的楼层没有标出来"
+          print("限流时不误标删除，真删了照样标出 ✓")
+
+          # 存档读不出来、或者文件夹里存的是别的帖子：拒绝覆盖
+          good = (home / "thread.json").read_text(encoding="utf-8")
+          (home / "thread.json").write_text(good[: len(good) // 2], encoding="utf-8")
+          for tid in (5, 6):
+              try:
+                  asyncio.run(td.archive(tid, home, no_images=True))
+                  raise AssertionError("存档读不出来 / 不是这个帖子时应该拒绝")
+              except td.ArchiveError as e:
+                  print("拒绝覆盖：", str(e).splitlines()[0])
+          assert (home / "thread.json").read_text(encoding="utf-8") == good[: len(good) // 2], "存档被覆盖了"
+          (home / "thread.json").write_text(good, encoding="utf-8")
+          try:
+              asyncio.run(td.archive(6, home, no_images=True))
+              raise AssertionError("文件夹里是别的帖子时应该拒绝")
+          except td.ArchiveError:
+              pass
+          print("存档损坏或不是这个帖子时不覆盖 ✓")
+
+          # 核对抓取时原帖正好没了：已有存档保留并标注「原帖看不到了」（返回码 4），不能当成「找不到」（6，网页版会当成还没存到）
+          short = {2: full[:10]}
+          async def fetch_then_gone(tid, bduss=""):
+              calls.append(1)
+              if len(calls) == 1:
+                  return thread(tid, copy.deepcopy(full), "2026-02-01 00:00:00")
+              if len(calls) in short:
+                  return thread(tid, copy.deepcopy(short[len(calls)]), "2026-02-02 00:00:00")
+              raise td.ThreadGone(td.NOT_FOUND_HINT)
+          calls.clear()
+          td.fetch_thread = fetch_then_gone
+          home = Path("gone-recheck")
+          asyncio.run(td.archive(7777777, home, no_images=True))
+          sys.argv = ["tieba_dump.py", "7777777", "-o", str(home), "--no-images"]
+          try:
+              td.cli()
+              raise AssertionError("应该以返回码 4 结束")
+          except SystemExit as e:
+              assert e.code == td.EXIT_GONE, f"返回码是 {e.code}，应该是 {td.EXIT_GONE}"
+          d = json.loads((home / "thread.json").read_text(encoding="utf-8"))
+          assert d.get("thread_gone_since") and len(d["floors"]) == 40 and not any(f.get("missing_since") for f in d["floors"]), "存档没有原样保留"
+          print("核对时原帖没了：存档保留并标注，没有当成找不到 ✓")
+
+          # 某一层的楼中楼这次没取全（比如这一层刚被删）：之前存的楼中楼照样保留、不标成已删除，帖子照常保存
+          def comment(pid, text):
+              return {"pid": pid, "user": {"show_name": "某人", "level": 1}, "is_thread_author": False,
+                      "create_time": f"2026-01-01 00:00:{pid % 60:02d}", "agree": 0, "text": text, "images": [],
+                      "fragments": [{"type": "Text", "text": text}]}
+          f1 = floor(1, "一楼")
+          f1["comments"] = [comment(1001, "甲"), comment(1002, "乙")]
+          f2 = copy.deepcopy(f1)
+          f2["comments"], f2["comments_incomplete"] = [comment(1001, "甲")], True
+          script3 = [[f1], [f2]]
+          async def fetch_partial(tid, bduss=""):
+              return thread(tid, copy.deepcopy(script3.pop(0)), f"2026-03-0{2 - len(script3)} 00:00:00")
+          td.fetch_thread = fetch_partial
+          home = Path("partial-test")
+          asyncio.run(td.archive(8, home, no_images=True))
+          d = asyncio.run(td.archive(8, home, no_images=True))
+          cs = d["floors"][0]["comments"]
+          assert [c["pid"] for c in cs] == [1001, 1002] and not any(c.get("missing_since") for c in cs), cs
+          assert "comments_incomplete" not in (home / "thread.json").read_text(encoding="utf-8"), "临时标记被存进了存档"
+          print("某层楼中楼没取全时，之前存的照样保留 ✓")
+
+          # threads.txt：行首是 ID 时后面都算备注；没有 ID 时认这一行里所有的链接
+          text = ("8651017931（我的帖子）\n8651017932：备注\n8651017933,备注\n"
+                  "8651017934 备注 https://tieba.baidu.com/p/1111111111\n"
+                  "https://tieba.baidu.com/p/2222222222 https://tieba.baidu.com/p/3333333333\n"
+                  "# 4444444444\n5555555555 # 注释\n乱写的一行\n")
+          assert au.ids_in(text) == ["8651017931", "8651017932", "8651017933", "8651017934", "2222222222",
+                                     "3333333333", "5555555555"], au.ids_in(text)
+          assert "&lt;!--" in au.cell("标题<!--") and "\\|" in au.cell("a|b") and "\\[" in au.cell("[b"), "首页表格没有转义"
+          print("threads.txt 的各种写法、首页表格转义 ✓")
+
+          # PDF 用的图片：特别长的截图切成几段，手机照片按拍摄方向转正，同一张图出现两次也一样处理
+          from PIL import Image
+          import topdf
+          src = Path("img-test")
+          (src / "images").mkdir(parents=True, exist_ok=True)
+          Image.new("RGB", (1080, 6000), "white").save(src / "images" / "tall.png")
+          exif = Image.Exif()
+          exif[0x0112] = 6  # 拍照时手机是竖着的：原始像素是横的，显示时要转 90 度
+          Image.new("RGB", (400, 200), "white").save(src / "images" / "rot.jpg", exif=exif)
+          imgs = [{"local": "images/tall.png", "width": 1080, "height": 6000}, {"local": "images/rot.jpg", "width": 400, "height": 200}]
+          data = {"floors": [{"images": imgs, "comments": [], "earlier_versions": [{"images": [{"local": "images/tall.png"}]}]}]}
+          dst = Path("img-out")
+          topdf.prepare_images(data, src, dst)
+          tall, rot = data["floors"][0]["images"]
+          again = data["floors"][0]["earlier_versions"][0]["images"][0]
+          parts = tall.get("print_parts", [])
+          assert len(parts) >= 10 and again.get("print_parts") == parts, "长截图没有切段"
+          assert all((dst / p).is_file() for p in parts) and "width" not in tall
+          assert sum(Image.open(dst / p).height for p in parts) == 6000, "切段后拼起来和原图不一样高"
+          assert render.frag_html("Image", {}, tall).count("<img") == len(parts), "切段后的图片没有都放进页面"
+          with Image.open(dst / rot["local"]) as im:
+              assert im.size == (200, 400), f"照片没有转正：{im.size}"
+          print("长截图切段、照片转正 ✓")
+
+          EOF
+
+      - name: 安装中文字体（Linux 运行环境不一定有，没有的话 PDF 里的中文会是方框）
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-color-emoji > /dev/null
+
+      - name: 命令行模式
+        run: |
+          python tieba_dump.py "https://tieba.baidu.com/p/$TEST_THREAD?fr=pb" -o out
+          # 旧仓库升级时少复制了 topdf.py：抓取不能受影响
+          mkdir no-topdf && cp tieba_dump.py render.py no-topdf/ && python no-topdf/tieba_dump.py --help > /dev/null
+
+      - name: 只增不减（模拟某层和某条楼中楼后来被删，重新抓取后应当保留）
+        run: |
+          python - <<'EOF'
+          import json
+          from pathlib import Path
+          p = Path("out/thread.json"); d = json.loads(p.read_text(encoding="utf-8"))
+          gone = "这一层后来被删了"
+          d["floors"].append(dict(d["floors"][-1], pid=1, floor=99999, text=gone, images=[], comments=[],
+                                  fragments=[{"type": "Text", "text": gone}]))
+          d["floors"][0]["comments"].append({"pid": 2, "user": d["floors"][0]["user"], "is_thread_author": False, "agree": 0,
+                                             "create_time": "2000-01-01 00:00:00", "text": gone, "images": [],
+                                             "fragments": [{"type": "Text", "text": gone}]})
+          p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+          EOF
+          python tieba_dump.py "$TEST_THREAD" -o out
+          python tieba_dump.py "$TEST_THREAD" -o out
+          python - <<'EOF'
+          import json
+          from pathlib import Path
+          d = json.loads(Path("out/thread.json").read_text(encoding="utf-8"))
+          f = [f for f in d["floors"] if f["pid"] == 1]
+          c = [c for c in d["floors"][0]["comments"] if c["pid"] == 2]
+          assert len(f) == 1 and f[0].get("missing_since"), "被删的楼层没有保留（或者重复了）"
+          assert len(c) == 1 and c[0].get("missing_since"), "被删的楼中楼没有保留（或者重复了）"
+          print("被删的楼层和楼中楼都保留了，没有重复 ✓")
+          EOF
+
+      - name: 问答模式（模拟输入：链接 → 不登录 → 要 PDF → 不打开）
+        run: printf '%s\nn\ny\nn\n' "$TEST_THREAD" | python tieba_dump.py
+
+      - name: 图片体积上限、--no-images 保留本地图片、只补下载图片
+        run: |
+          python - <<'EOF'
+          import asyncio, json
+          from pathlib import Path
+          import tieba_dump as td
+
+          td.IMG_CONCURRENCY = 1  # 一张一张下，才好检查体积上限
+          d = json.loads(Path("out/thread.json").read_text(encoding="utf-8"))
+          url = next(im["origin_src"] for f in d["floors"] for im in f["images"])
+          imgs = [{"hash": "h1", "origin_src": url}, {"hash": "h2", "origin_src": url}]
+          test = {"floors": [{"floor": 1, "images": imgs, "comments": []}]}
+          assert asyncio.run(td.download_images(test, Path("budget"), max_bytes=1)) is True, "到了体积上限应该停下"
+          assert sum("local" in im for im in imgs) == 1
+          assert asyncio.run(td.download_images(test, Path("budget"), max_bytes=1)) is False
+          assert all("local" in im for im in imgs), "第二次没有接着下完"
+          print("图片按体积分批下载 ✓")
+          EOF
+          python tieba_dump.py "$TEST_THREAD" -o out --no-images
+          python -c "import json; d = json.load(open('out/thread.json', encoding='utf-8')); assert all(im.get('local') for f in d['floors'] if not f.get('missing_since') for im in f['images']), '--no-images 丢了本地图片'; print('--no-images 保留本地图片 ✓')"
+          python tieba_dump.py "$TEST_THREAD" -o out --images-only
+
+      - name: 一次更新全部已存的帖子（命令行和问答模式）
+        run: |
+          python tieba_dump.py --update-all 贴吧存档 | tee update.log
+          printf '1\n' | python tieba_dump.py | tee update2.log
+          grep -q "全部处理完：1 个已更新" update2.log || { echo "::error::问答模式输入 1 没有更新全部帖子"; exit 1; }
+
+      - name: 原帖整个被删除（模拟）：存档原样保留并标注，重新出现后标注去掉
+        run: |
+          python - <<'EOF'
+          import asyncio, json, os
+          from pathlib import Path
+          import tieba_dump as td
+
+          tid, out = int(os.environ["TEST_THREAD"]), Path("out")
+          before = json.loads((out / "thread.json").read_text(encoding="utf-8"))
+
+          async def gone(*args, **kwargs):
+              raise td.ThreadGone(td.NOT_FOUND_HINT)
+
+          td.fetch_thread = gone
+          d1 = asyncio.run(td.archive(tid, out))
+          d2 = asyncio.run(td.archive(tid, out))
+          assert d1.get("thread_gone_since") and d1["thread_gone_since"] == d2["thread_gone_since"], "没有标注原帖已删除，或者标注时间每次都变"
+          assert d2["floors"] == before["floors"], "原帖删除后，已存的楼层被改动了"
+          assert "已经看不到了" in (out / "index.html").read_text(encoding="utf-8"), "网页上没有提示原帖已删除"
+          try:
+              asyncio.run(td.archive(tid, Path("never-saved")))
+              raise AssertionError("从没存过的帖子找不到时应该报错")
+          except td.ThreadGone:
+              pass
+          print("原帖删除后存档原样保留，并标注 ✓")
+          EOF
+          python tieba_dump.py "$TEST_THREAD" -o out
+          python -c "import json; d = json.load(open('out/thread.json', encoding='utf-8')); assert 'thread_gone_since' not in d; print('原帖重新出现后标注去掉 ✓')"
+
+      - name: 登录相关（模拟）：公开帖子登录着存的不误报；要登录的帖子不误判为被删
+        run: |
+          python - <<'EOF'
+          import asyncio, copy, json
+          from pathlib import Path
+          import tieba_dump as td
+
+          def fake(tid):
+              f = {"floor": 1, "pid": tid * 10, "user": {"show_name": "a", "user_id": 1}, "is_thread_author": True,
+                   "create_time": "2026-01-01 00:00:00", "agree": 0, "disagree": 0, "text": "hi",
+                   "fragments": [{"type": "Text", "text": "hi"}], "images": [], "reply_num": 0, "comments": []}
+              return {"tid": tid, "title": f"帖子{tid}", "forum": "测试", "fid": 1, "author": {"show_name": "a", "user_id": 1},
+                      "create_time": "2026-01-01 00:00:00", "reply_num": 1, "agree": 0,
+                      "url": f"https://tieba.baidu.com/p/{tid}", "fetched_at": "2026-01-01 00:00:00", "floors": [f]}
+
+          PUBLIC, HIDDEN = 111111111, 222222222
+          state = {"deleted": set()}
+
+          async def fetch(tid, bduss=""):
+              if tid in state["deleted"] or (tid == HIDDEN and not bduss):
+                  raise td.ThreadGone(td.NOT_FOUND_HINT)
+              return copy.deepcopy(fake(tid))
+
+          async def visible(tid):
+              return tid == PUBLIC and tid not in state["deleted"]
+
+          td.fetch_thread, td.visible_without_login = fetch, visible
+          home, login = Path("login-test"), "x" * 192
+          for tid in (PUBLIC, HIDDEN):  # 都是登录着存的
+              asyncio.run(td.archive(tid, home / f"tieba_{tid}", login))
+          load = lambda tid: json.loads((home / f"tieba_{tid}" / "thread.json").read_text(encoding="utf-8"))
+          assert "needs_login" not in load(PUBLIC), "公开帖子登录着存的，被误记成要登录"
+          assert load(HIDDEN).get("needs_login"), "要登录才能看的帖子没有记下来"
+
+          r = asyncio.run(td.update_all(td.find_archives(home)))  # 不登录更新全部
+          assert [x[0] for x in r["need_login"]] == [HIDDEN] and not r["failed"], r
+          assert "thread_gone_since" not in load(HIDDEN), "要登录的帖子不登录更新时，被误判为原帖被删"
+
+          state["deleted"] = {PUBLIC}  # 公开帖子后来被删：不登录也应该直接标注，而不是提示登录
+          r = asyncio.run(td.update_all(td.find_archives(home)))
+          assert load(PUBLIC).get("thread_gone_since"), "公开帖子被删后没有标注"
+          assert [x[0] for x in r["need_login"]] == [HIDDEN], r
+
+          r = asyncio.run(td.update_all(r["need_login"], login))  # 登录后更新要登录的帖子
+          assert not r["need_login"] and not r["failed"], r
+          print("登录相关的各种情况 ✓")
+          EOF
+
+      - name: 模拟网页版的存档仓库：首页换成存档列表、图片没下完下次补上、逐个帖子提交、添加帖子
+        run: |
+          mkdir repo && cd repo
+          git init -q && git config user.name test && git config user.email test@example.com
+          cp -r ../README.md ../threads.txt ../.github . && git add -A && git commit -qm "从模板创建"
+          out="archives/tieba_$TEST_THREAD"
+          TIEBA_DEADLINE=1 python ../tieba_dump.py "$TEST_THREAD" -o "$out"
+          python -c "import json; d = json.load(open('$out/thread.json', encoding='utf-8')); assert not any(im.get('local') for f in d['floors'] for im in f['images']), '过了截止时间还在下载图片'"
+          python ../.github/scripts/archive_update.py . && git add -A && git commit -qm first
+          cmp -s ../README.md USAGE.md || { echo "::error::原来的使用说明没有改名保留为 USAGE.md"; exit 1; }
+          grep -q "archives/tieba_$TEST_THREAD/thread.md" README.md || { echo "::error::首页没有换成存档列表"; exit 1; }
+          grep -q "目前设置为每天北京时间 6:00 自动检查一次" README.md || { echo "::error::首页的检查时间没有从 archive.yml 读出来"; exit 1; }
+          echo "首页换成存档列表，使用说明保留为 USAGE.md ✓"
+          python ../tieba_dump.py "$TEST_THREAD" -o "$out"
+          msg="$(python ../.github/scripts/archive_update.py .)"
+          echo "$msg"
+          echo "$msg" | grep -q "补下载" || { echo "::error::补下载的图片没被当成变化（会被还原丢掉）"; exit 1; }
+          git add -A && git commit -qm second
+          set +e
+          python ../.github/scripts/archive_update.py .
+          rc=$?
+          set -e
+          [ $rc -eq 3 ] || { echo "::error::没有变化时应该返回 3，实际是 $rc"; exit 1; }
+          cmp -s ../README.md USAGE.md || { echo "::error::USAGE.md 被改动了"; exit 1; }
+          echo "补下载的图片会被提交，没有变化时不提交 ✓"
+          # 逐个帖子提交（--only）：重新抓取后内容没变，要还原成上一版、不产生提交
+          python ../tieba_dump.py "$TEST_THREAD" -o "$out" --no-images
+          set +e
+          python ../.github/scripts/archive_update.py --only "$TEST_THREAD" .
+          rc=$?
+          set -e
+          [ $rc -eq 3 ] && [ -z "$(git status --porcelain)" ] || { echo "::error::--only 时内容没变却没有还原（返回 $rc）"; git status --short; exit 1; }
+          echo "逐个帖子提交：内容没变时还原 ✓"
+          printf '%s\n' "$TEST_THREAD" >> threads.txt
+          python ../.github/scripts/archive_update.py --add "https://tieba.baidu.com/p/111111111 https://tieba.baidu.com/p/222222222" .
+          printf '333333333（备注）\n' >> threads.txt
+          ids="$(python ../.github/scripts/archive_update.py --ids . | tr -d '\r' | tr '\n' ' ')" # Windows 上的输出带 \r
+          [ "$ids" = "111111111 222222222 333333333 $TEST_THREAD " ] || { echo "::error::还没存过的帖子应该排在前面：$ids"; exit 1; }
+          msg="$(python ../.github/scripts/archive_update.py .)"
+          echo "$msg"
+          echo "$msg" | grep -q "添加帖子：.*222222222、333333333" || { echo "::error::提交说明里没写新增的帖子"; exit 1; }
+          grep -q "还没存到" README.md || { echo "::error::首页没有标出还没存到的帖子"; exit 1; }
+          echo "一次添加多个帖子、还没存过的排在前面 ✓"
+
+      - name: 重新生成页面、生成 PDF
+        run: |
+          python render.py out
+          # 输出到已有的文件夹：只替换本工具生成的 PDF，别的文件不能动
+          mkdir pdf-out && echo 用户自己的文件 > "pdf-out/我的文件.pdf"
+          python topdf.py out -o pdf-out
+          first="$(ls pdf-out/*_1-100楼.pdf)"
+          stale="${first%_1-100楼.pdf}_901-1000楼.pdf"
+          touch "$stale"
+          python topdf.py out -o pdf-out
+          [ -f "pdf-out/我的文件.pdf" ] || { echo "::error::topdf 删掉了用户自己的文件"; exit 1; }
+          [ ! -e "$stale" ] || { echo "::error::上次生成的旧分册没有删掉"; exit 1; }
+          rm "pdf-out/我的文件.pdf"
+          echo "PDF 输出到已有文件夹时只替换自己生成的文件 ✓"
+          pip install -q pypdf
+
+      - name: 检查结果
+        run: |
+          python - <<'EOF'
+          import json, os, unicodedata
+          from pathlib import Path
+          from pypdf import PdfReader
+
+          def pdf_text(pdfs):  # 从 PDF 提取的中文里，「一」之类的字可能是长得一样的部首字符，统一一下再比较
+              return unicodedata.normalize("NFKC", "".join(page.extract_text() or "" for p in pdfs for page in PdfReader(p).pages))
+
+          tid = os.environ["TEST_THREAD"]
+          for d in (Path("out"), Path("贴吧存档") / f"tieba_{tid}"):
+              data = json.loads((d / "thread.json").read_text(encoding="utf-8"))
+              assert data["floors"], f"{d}: 没有抓到楼层"
+              assert (d / "index.html").exists() and (d / "thread.md").exists(), f"{d}: 缺少页面"
+              assert not any(not c["fragments"] for f in data["floors"] for c in f["comments"]), f"{d}: 有空的楼中楼"
+              links = [fr for f in data["floors"] for fr in f["fragments"] if fr["type"].startswith("Link")]
+              assert links and all(fr.get("url") for fr in links), f"{d}: 链接丢失"
+              assert "http://tieba.baidu.com" not in json.dumps(data), f"{d}: 网址没有统一成 https"
+              print(f"{d}: {len(data['floors'])} 层，{len(links)} 个链接 ✓")
+
+          # 存档里不存个人信息：每个人只有昵称、等级、是否吧务，没有用户 ID、IP 属地、回复对象 ID
+          for d in (Path("out"), Path("贴吧存档") / f"tieba_{tid}"):
+              data = json.loads((d / "thread.json").read_text(encoding="utf-8"))
+              users = [data["author"]] + [f["user"] for f in data["floors"]] + [c["user"] for f in data["floors"] for c in f["comments"]]
+              assert all(set(u) <= {"show_name", "level", "is_bawu"} for u in users), f"{d}: 存档里还有个人信息"
+              assert "user_id" not in json.dumps(data) and "reply_to_id" not in json.dumps(data), f"{d}: 存档里还有用户 ID"
+              print(f"{d}: 存档里没有个人信息 ✓")
+
+          # PDF：每 100 层一个文件，中文正常；已删除的内容保留
+          data = json.loads(Path("out/thread.json").read_text(encoding="utf-8"))
+          for d in (Path("pdf-out"), Path("贴吧存档") / f"tieba_{tid}_PDF"):
+              pdfs = sorted(d.glob("*.pdf"))
+              assert pdfs, f"{d}: 没有生成 PDF"
+              assert data["title"] in pdf_text(pdfs), f"{d}: PDF 里没有帖子标题（中文字体有问题？）"
+              # PDF 里的链接只能是网址：指向本地文件的链接会把电脑上的路径（含用户名）带出去
+              uris = [a.get_object()["/A"].get("/URI", "") for p in pdfs for page in PdfReader(p).pages
+                      for a in page.get("/Annots", []) if "/A" in a.get_object()]
+              assert not [u for u in uris if not str(u).startswith(("http://", "https://"))], f"{d}: PDF 里有指向本地文件的链接"
+              print(f"{d}: {len(pdfs)} 个 PDF，{len(uris)} 个网址链接，没有本地文件链接 ✓")
+          text = pdf_text(Path("pdf-out").glob("*.pdf"))
+          assert "这一层后来被删了" in text and "已删除" in text, "PDF 里缺少已删除的楼层或标注"
+          assert "点击" not in text and "点开" not in text, "PDF 里还有「点击展开」之类的提示"
+          print("PDF 保留已删除的楼层并标注 ✓")
+          EOF

@@ -1,0 +1,169 @@
+# 抓取 threads.txt 里列出的帖子，存到 archives/ 文件夹，内容有变化时提交；仓库首页的 README.md 是存档列表。
+# 只在用模板创建的存档仓库里运行：工具本身的公开仓库（jas-herb/tieba-archiver）不存档。
+name: 贴吧存档
+
+on:
+  schedule:
+    - cron: "0 22 * * *" # 每天 UTC 22:00 = 北京时间 06:00（高峰期可能会延迟一会儿）
+  workflow_dispatch:
+    inputs:
+      thread:
+        description: "要新增的帖子链接或 ID，一次可以填多个（用空格隔开）；不填就只更新已有的帖子"
+        required: false
+        default: ""
+      pdf:
+        description: "同时生成 PDF（每 100 层一个文件，可以直接发给别人），完成后在运行页面底部下载"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 同一时间只跑一次。注意：运行中再点 Run workflow，只会保留最后一次排队的，中间排队的会被取消，
+# 所以要一次加好几个帖子，请把链接都填在同一个框里。
+concurrency:
+  group: archive
+  cancel-in-progress: false
+
+jobs:
+  archive:
+    if: github.repository != 'jas-herb/tieba-archiver'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150 # 图片下载到 90 分钟就停（见下面的 TIEBA_DEADLINE），留出抓文字和提交的时间
+    env:
+      TZ: Asia/Shanghai # 机器默认是 UTC，存档里的时间统一用北京时间
+      # 每次提交最多带这么多 MB 的新图片：GitHub 单次推送不能超过 2 GB，图片多的大帖分几批推（同一次运行里接着下）
+      TIEBA_MAX_MB: "900"
+    steps:
+      - name: 取出工具代码
+        uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 添加新帖子
+        if: inputs.thread != ''
+        env:
+          THREAD: ${{ inputs.thread }} # 通过环境变量传入，不直接拼进命令
+        run: python .github/scripts/archive_update.py --add "$THREAD" .
+
+      - name: 逐个抓取，有变化就提交（顺便更新首页的存档列表）
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          changed=0
+
+          # 推送。运行期间仓库如果在别处被改过（比如在网页上编辑了 threads.txt），先接上远程的改动再推
+          push() {
+            local attempt
+            for attempt in 1 2 3; do
+              git push -q origin "HEAD:$GITHUB_REF_NAME" && return 0
+              echo "推送被拒绝，接上仓库里别处的改动后重试……"
+              git fetch -q --depth=5 origin "$GITHUB_REF_NAME"
+              if ! git rebase -q FETCH_HEAD; then
+                git rebase --abort || true
+                echo "::error::和仓库里别处的改动冲突，没法自动合并，请稍后重新运行一次"
+                exit 1
+              fi
+            done
+            echo "::error::推送一直失败，请稍后重新运行一次"
+            exit 1
+          }
+
+          # 每个帖子抓完就提交推送：后面的帖子出问题、或者整体超时，前面的成果也不会白费
+          commit_if_changed() {
+            local msg code # 局部变量：别覆盖外面循环用的 rc
+            set +e
+            msg="$(python .github/scripts/archive_update.py "$@" .)"
+            code=$?
+            set -e
+            if [ $code -eq 3 ]; then return 0; fi # 内容没有变化
+            if [ $code -ne 0 ]; then echo "::error::更新存档时出错"; exit $code; fi
+            git add -A
+            git commit -q -m "$msg"
+            push
+            echo "$msg" | tee -a "$GITHUB_STEP_SUMMARY"
+            changed=1
+          }
+
+          # 图片下载的截止时间：超大的帖子第一次存档时图片很多，到点先把已下载的提交，剩下的下次运行接着下
+          export TIEBA_DEADLINE=$(( $(date +%s) + 90 * 60 ))
+          : > "$RUNNER_TEMP/failed"
+          for tid in $(python .github/scripts/archive_update.py --ids .); do
+            if [ "$(date +%s)" -gt "$TIEBA_DEADLINE" ]; then
+              echo "::warning::时间不够了，从 $tid 开始的帖子下次再抓"
+              break
+            fi
+            echo "::group::$tid"
+            set +e
+            python tieba_dump.py "$tid" -o "archives/tieba_$tid"
+            rc=$?
+            set -e
+            echo "::endgroup::"
+            case $rc in
+              0 | 5) ;; # 5：图片还没下完，下面分批接着下
+              4) echo "::notice::原帖已经看不到了（被删除或隐藏），存档原样保留：$tid" ;;
+              6) # 刚发的帖子审核期间也是这样：不停止跟踪，下次接着试
+                echo "::notice::还没找到这个帖子（刚发的帖子可能还在审核中，也可能链接有误或已被删除），下次检查时再试：$tid"
+                ;;
+              *)
+                echo "::warning::抓取失败：$tid"
+                echo "$tid" >> "$RUNNER_TEMP/failed"
+                ;;
+            esac
+            commit_if_changed --only "$tid"
+            # 图片多的大帖：每下载一批（TIEBA_MAX_MB）就先提交推送一次，再接着下，直到下完或者到截止时间
+            while [ $rc -eq 5 ] && [ "$(date +%s)" -lt "$TIEBA_DEADLINE" ]; do
+              set +e
+              python tieba_dump.py "$tid" -o "archives/tieba_$tid" --images-only
+              rc=$?
+              set -e
+              commit_if_changed --only "$tid"
+            done
+          done
+          commit_if_changed # 最后整体检查一遍：页面格式的更新、threads.txt 和存档列表的变化
+          [ $changed -eq 1 ] || echo "内容没有变化，不提交" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: 生成 PDF
+        id: pdf
+        if: inputs.pdf
+        run: |
+          # 运行环境不一定带中文字体，不装的话 PDF 里的中文会显示成方框。装不上也接着生成（总比没有强）
+          if ! { sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk fonts-noto-color-emoji > /dev/null; }; then
+            echo "::warning::中文字体没装上，PDF 里的中文可能显示成方框。可以稍后重新运行一次。"
+          fi
+          out="$RUNNER_TEMP/PDF"
+          mkdir -p "$out"
+          for d in archives/tieba_*/; do
+            d="${d%/}"
+            if [ -f "$d/thread.json" ]; then python topdf.py "$d" -o "$out/$(basename "$d")"; fi
+          done
+          # 免费账号的私有仓库，Actions 附件空间大约只有 500 MB：太大的传不上去，请用电脑版生成
+          mb=$(du -sm "$out" | cut -f1)
+          if [ "$mb" -gt 450 ]; then
+            echo "::warning::PDF 一共有 ${mb} MB，超过了 GitHub 免费账号的附件空间（约 500 MB），没法在这里下载。请用电脑版生成。"
+            echo "PDF 一共有 ${mb} MB，太大了，没有上传。请用电脑版生成。" >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "PDF 已生成（${mb} MB）：在本次运行页面底部的 Artifacts 里下载「PDF」，保留 3 天" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: inputs.pdf && steps.pdf.outputs.ok == 'true'
+        with:
+          name: PDF
+          path: ${{ runner.temp }}/PDF
+          retention-days: 3 # 免费账号的附件空间是保留期内所有运行加在一起算的：留得短一些，多生成几次也不会满
+
+      - name: 有帖子抓取失败时标红
+        run: |
+          if [ -s "$RUNNER_TEMP/failed" ]; then
+            echo "::error::以下帖子抓取失败：$(tr '\n' ' ' < "$RUNNER_TEMP/failed")"
+            exit 1
+          fi
