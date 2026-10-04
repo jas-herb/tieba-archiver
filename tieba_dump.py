@@ -139,7 +139,7 @@ def comment_dict(c) -> dict:
         "user": user_dict(c.user),
         "is_thread_author": bool(getattr(c, "is_thread_author", False)),
         "create_time": ts(c.create_time),
-        "agree": c.agree,
+        "agree": getattr(c, "agree", 0),  # aiotieba 4.8 起，随楼层带回的楼中楼不再有点赞数
         "text": https(c.text),
         **contents_dict(c.contents),
     }
@@ -254,7 +254,7 @@ async def fetch_thread(tid: int, bduss: str = "") -> dict:
                     "author": user_dict(th.user),
                     "create_time": ts(th.create_time),
                     "reply_num": th.reply_num,
-                    "agree": th.agree,
+                    "agree": getattr(th, "agree", 0),
                     "url": f"https://tieba.baidu.com/p/{tid}",
                 }
             print(f"第 {pn}/{posts.page.total_page} 页，{len(posts)} 层")
@@ -282,8 +282,8 @@ async def fetch_thread(tid: int, bduss: str = "") -> dict:
                     "user": user_dict(p.user),
                     "is_thread_author": p.is_thread_author,
                     "create_time": ts(p.create_time),
-                    "agree": p.agree,
-                    "disagree": p.disagree,
+                    "agree": getattr(p, "agree", 0),  # 点赞数可有可无：aiotieba 升级时去掉了也不影响存档
+                    "disagree": getattr(p, "disagree", 0),
                     "text": https(p.text),
                     **contents_dict(p.contents),
                     "reply_num": p.reply_num,
